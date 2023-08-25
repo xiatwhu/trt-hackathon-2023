@@ -46,30 +46,31 @@
 
 ### Bug报告（可选）
 
-提交bug是对TensorRT/TensorRT-LLM的另一种贡献。发现的TensorRT/TensorRT-LLM或cookbook、或文档和教程相关bug，请提交到[github issues](https://github.com/NVIDIA/trt-samples-for-hackathon-cn/issues)，并请在这里给出链接。  
-
-对于每个bug，请标记上hackathon2023标签，并写好正文：
-
-- 对于cookbook或文档和教程相关bug，说清楚问题即可，不必很详细。
-- 对于TensorRT bug，首先确认在云主机上使用NGC docker + TensorRT 9.0.0.1可复现。
-- 然后填写如下模板，并请导师复核确认（前面“评分标准”已经提到，确认有效可得附加分）：
-  - Environment
-    - TensorRT 9.0.0.1
-    - Versions of CUDA, CUBLAS, CuDNN used
-    - Container used
-    - NVIDIA driver version
-  - Reproduction Steps
-    - Provide detailed reproduction steps for the issue here, including any commands run on the command line.
-  - Expected Behavior
-    - Provide a brief summary of the expected behavior of the software. Provide output files or examples if possible.
-  - Actual Behavior
-    - Describe the actual behavior of the software and how it deviates from the expected behavior. Provide output files or examples if possible.
-  - Additional Notes
-    - Provide any additional context here you think might be useful for the TensorRT team to help debug this issue (such as experiments done, potential things to investigate).
+- [TensorRT 在转换包含 Trilu 的 onnx 模型时可能会获得错误的结果](https://github.com/NVIDIA/trt-samples-for-hackathon-cn/issues/84)
 
 ### 送分题答案（可选）
 
-如果你做了送分题，请把答案写在这里。
+#### Q: ```python3 run.py --max_output_len=8```
+
+A: chef before moving to London in the early
+
+#### Q:  ```python3 summarize.py --engine_dir trt_engine/gpt2/fp16/1-gpu --test_hf  --batch_size 1 --test_trt_llm  --hf_model_location=gpt2 --check_accuracy --tensorrt_llm_rouge1_threshold=14```
+
+A:
+```
+TensorRT-LLM (total latency: 2.482206106185913 sec)
+TensorRT-LLM beam 0 result
+  rouge1 : 15.361040799540035
+  rouge2 : 3.854022269668396
+  rougeL : 12.078455591738333
+  rougeLsum : 13.547802733617264
+Hugging Face (total latency: 9.922046184539795 sec)
+HF beam 0 result
+  rouge1 : 14.75593024343394
+  rouge2 : 3.3647470801871733
+  rougeL : 11.124766996533
+  rougeLsum : 13.031128048110618
+```
 
 ### 经验与体会（可选）
 
