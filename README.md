@@ -58,18 +58,18 @@ A: chef before moving to London in the early
 
 A:
 ```
-TensorRT-LLM (total latency: 2.482206106185913 sec)
+TensorRT-LLM (total latency: 2.840153455734253 sec)
 TensorRT-LLM beam 0 result
-  rouge1 : 15.361040799540035
-  rouge2 : 3.854022269668396
-  rougeL : 12.078455591738333
-  rougeLsum : 13.547802733617264
-Hugging Face (total latency: 9.922046184539795 sec)
+  rouge1 : 21.869322054781037
+  rouge2 : 6.258925475911645
+  rougeL : 16.755771650012953
+  rougeLsum : 18.68034777724496
+Hugging Face (total latency: 14.237422227859497 sec)
 HF beam 0 result
-  rouge1 : 14.75593024343394
-  rouge2 : 3.3647470801871733
-  rougeL : 11.124766996533
-  rougeLsum : 13.031128048110618
+  rouge1 : 18.182978950152904
+  rouge2 : 5.166241888544473
+  rougeL : 14.851620358520162
+  rougeLsum : 16.95757748412272
 ```
 
 ### 经验与体会（可选）
