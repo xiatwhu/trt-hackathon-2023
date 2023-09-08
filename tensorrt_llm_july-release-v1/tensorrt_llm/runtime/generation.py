@@ -130,6 +130,9 @@ class SamplingConfig:
     min_length: int = field(default=1)
     presence_penalty: float = field(default=0.0)
 
+    skip_step: int = field(default=8)
+    check_step: int = field(default=4)
+
     ## None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
     ## The real default value is set in dynamicDecodeOp.cpp when it's None
     beam_search_diversity_rate: float = field(init=False, default=None)
@@ -155,6 +158,11 @@ class GenerationSession(object):
                  debug_mode=False):
         assert isinstance(model_config, ModelConfig)
         self._model_config = model_config
+
+        # 设置 torch 默认 stream
+        self.stream = cudart.cudaStreamCreateWithPriority(cudart.cudaStreamNonBlocking, 0)[1]
+        torch.cuda.set_stream(torch.cuda.ExternalStream(int(self.stream)))
+
         runtime = _Runtime(engine_buffer, mapping)
 
         self.mapping = mapping
@@ -336,6 +344,7 @@ class GenerationSession(object):
         else:
             self.random_seed = None
 
+        # XXX  需要进一步查看 c++ 代码
         self.dynamic_decoder.setup(
             batch_size, scfg.num_beams, self.top_k, self.top_p,
             self.temperature, self.repetition_penalty, self.presence_penalty,
@@ -409,6 +418,8 @@ class GenerationSession(object):
         self.finished = torch.zeros((batch_size, scfg.num_beams),
                                     dtype=torch.bool,
                                     device=self.device)
+        
+        self.finished_sum = torch.zeros((1,), dtype=torch.int, device=self.device)
 
     def setup(self, batch_size: int, max_input_length: int,
               max_new_tokens: int):
@@ -946,7 +957,7 @@ class GenerationSession(object):
                 next_token_logits = logits.reshape(
                     (batch_size, scfg.num_beams, -1)).to(torch.float32)
                 decode_step = step + max_input_length
-                should_stop = self.dynamic_decoder.forward(
+                self.dynamic_decoder.forward(
                     next_token_logits, decode_step, max_input_length, ite,
                     batch_size, self.end_ids, self.top_k, self.top_p,
                     self.temperature, self.repetition_penalty,
@@ -956,11 +967,18 @@ class GenerationSession(object):
                     self.embedding_bias_opt, input_lengths,
                     sequence_limit_lengths, self.stop_words_list,
                     self.bad_words_list, this_src_cache_indirection,
-                    self.output_ids, self.finished, sequence_lengths,
+                    self.output_ids, self.finished_sum, self.finished, sequence_lengths,
                     self.cum_log_probs, self.log_probs, self.parent_ids,
                     this_tgt_cache_indirection)
 
-                if should_stop.item():
+                # print(step, self.finished_sum, self.finished)
+                if step == self.max_new_tokens - 1 \
+                        or (step >= scfg.skip_step and (step - scfg.skip_step) % scfg.check_step == 0):
+                    should_stop = self.finished_sum.cpu().item() == batch_size
+                else:
+                    should_stop = False
+
+                if should_stop:
                     if self.paged_kv_cache:
                         # Free all blocks in all sequences.
                         # With in-flight batching and while loop we'll free some sequences, when they are done

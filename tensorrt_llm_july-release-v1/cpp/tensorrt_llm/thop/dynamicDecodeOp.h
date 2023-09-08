@@ -116,7 +116,7 @@ public:
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt);
 
-    th::Tensor forward(th::Tensor logits, // (batch_size, beam_width, vocab_size)
+    void forward(th::Tensor logits, // (batch_size, beam_width, vocab_size)
         int64_t step, int64_t max_input_length, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
         th::optional<th::Tensor> runtime_top_k_opt, th::optional<th::Tensor> runtime_top_p_opt,
         th::optional<th::Tensor> temperature_opt, th::optional<th::Tensor> repetition_penalty_opt,
@@ -128,7 +128,7 @@ public:
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> src_cache_indirection_opt,
         // output buffers.
-        th::Tensor output_token_ids, th::optional<th::Tensor> finished_opt,
+        th::Tensor output_token_ids, th::Tensor finished_sum, th::optional<th::Tensor> finished_opt,
         th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
         th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt);

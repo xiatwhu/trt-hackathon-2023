@@ -164,6 +164,7 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams outputParams{output_ids_converted};
 
     safeUpdate<bool>(finished_opt, outputParams.finished);
+#if 0
     tr::BufferManager::ITensorPtr finished_sum;
     std::int32_t* finished_sum_host = nullptr;
     if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
@@ -173,6 +174,10 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
         finished_sum_host = tr::bufferCast<std::int32_t>(*finished_sum);
         *finished_sum_host = 0;
     }
+#else
+    // safeUpdate<int>(should_stop, outputParams.finished_sum);
+    outputParams.finished_sum = convert_tensor<int>(should_stop);
+#endif
     safeUpdate<int>(sequence_lengths_opt, outputParams.sequence_length);
     safeUpdate<int>(parent_ids_opt, outputParams.parent_ids);
     safeUpdate<float>(cum_log_probs_opt, outputParams.cum_log_probs);
@@ -180,6 +185,7 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     safeUpdate<int>(tgt_cache_indirection_opt, outputParams.tgt_cache_indirection);
 
     dynamic_decode_layer_->forward(outputParams, forwardParams);
+#if 0
     if (finished_sum_host)
     {
         auto const numToFinish = outputParams.finished->size();
@@ -187,6 +193,7 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
         auto should_stop_accessor = should_stop.accessor<bool, 1>();
         should_stop_accessor[0] = numToFinish == *finished_sum_host;
     }
+#endif
 }
 
 DynamicDecodeOp::DynamicDecodeOp(const int64_t vocab_size, const int64_t vocab_size_padded,
@@ -252,7 +259,7 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
         top_p_reset_ids_opt);
 }
 
-th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length, int64_t ite,
+void DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length, int64_t ite,
     int64_t local_batch_size, th::Tensor end_id, th::optional<th::Tensor> runtime_top_k_opt,
     th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
     th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
@@ -264,7 +271,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> src_cache_indirection_opt,
     // output buffers.
-    th::Tensor output_token_ids, th::optional<th::Tensor> finished_opt,
+    th::Tensor output_token_ids, th::Tensor finished_sum, th::optional<th::Tensor> finished_opt,
     th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
     th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
     th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt)
@@ -290,8 +297,10 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     //     stop_words_list: [batch_size, 2, stop_words_length], int, optional
     //     bad_words_list: [2, stop_words_length], int, optional
     //     src_cache_indirection: [local_batch_size, beam_width, memory_length],
-    //     int, optional output_token_ids: [max_seq_length, batch_size,
-    //     beam_width], int finished: [batch_size * beam_width], bool, optional
+    //     int, optional 
+    //     output_token_ids: [max_seq_length, batch_size, beam_width], int
+    //     finished_sum: [1], int
+    //     finished: [batch_size * beam_width], bool, optional
     //     sequence_lengths: [batch_size * beam_width], int, optional
     //     cum_log_probs: [batch_size * beam_width], float, optional
     //     output_log_probs: [gen_length, batch_size, beam_width], float, optional
@@ -330,6 +339,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
 
     CHECK_INPUT(output_token_ids, torch::kInt32);
+    CHECK_INPUT(finished_sum, torch::kInt32);
     CHECK_OPTIONAL_INPUT(finished_opt, torch::kBool);
     CHECK_OPTIONAL_INPUT(seuqence_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
@@ -337,7 +347,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(parent_ids_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(tgt_cache_indirection_opt, torch::kInt32);
 
-    th::Tensor should_stop = torch::zeros({1}, torch::dtype(torch::kBool).requires_grad(false));
+    // th::Tensor should_stop = torch::zeros({1}, torch::dtype(torch::kBool).requires_grad(false));
 
     dynamic_decode_->forward(
         // Inputs
@@ -348,10 +358,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
         input_lengths_opt, sequence_limit_length_opt, stop_words_list_opt, bad_words_list_opt,
         src_cache_indirection_opt,
         // Outputs
-        output_token_ids, should_stop, finished_opt, seuqence_lengths_opt, cum_log_probs_opt, output_log_probs_opt,
+        output_token_ids, finished_sum, finished_opt, seuqence_lengths_opt, cum_log_probs_opt, output_log_probs_opt,
         parent_ids_opt, tgt_cache_indirection_opt);
-
-    return should_stop;
 }
 
 } // namespace torch_ext
