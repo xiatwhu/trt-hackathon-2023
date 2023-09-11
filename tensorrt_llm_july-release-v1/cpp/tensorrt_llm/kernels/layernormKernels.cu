@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/layernormKernels.h"
@@ -34,6 +35,143 @@ __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_varianc
         ret = ret + cuda_cast<Tf>(beta[i]);
     }
     return ret;
+}
+
+/* Computes the layernorm https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
+ * normed_output <- ( (input - E[input]) / Sqrt(Var[input] + eps) ) * gamma + beta
+ * input is [tokens, hidden_dim]. Mean and Variance are per-row (i.e. per-token)
+ *
+ * One Warp handles one row.
+ *
+ * with USE_DIFF_OF_SQUARES set to false:
+ * First pass (loop) computes the mean.
+ * Second computes the variance via Var[x] = E[(x - E[x])²].
+ * Third pass computes and writes normed_output
+ *
+ * with USE_DIFF_OF_SQUARES set to true (may be faster but less accurate):
+ * First pass (loop) computes the mean and variance via Var[x] = E[x²] - E[x]²
+ * Second pass computes and writes normed_output
+ */
+template <typename T, int COLS_PER_THREAD, bool USE_DIFF_OF_SQUARES = false>
+__global__ void generalLayerNormWarp(const T* input, const T* gamma, const T* beta, T* normed_output, const float eps,
+    int tokens, int hidden_dim)
+{
+    constexpr auto num_elems_T = num_elems<T>::value;
+    using float_packed_t = typename packed_as<float, num_elems_T>::type;
+    using T_scalar = typename packed_as<T, 1>::type;
+
+    static_assert(COLS_PER_THREAD % num_elems_T == 0, "");
+    constexpr int pack_per_thread = COLS_PER_THREAD / num_elems_T;
+
+    // const int tidx = threadIdx.x;
+    // const int bidx = blockIdx.x;
+    const int global_warp_id = blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane_id = threadIdx.x;
+
+    if (global_warp_id >= tokens) {
+        return;
+    }
+
+    float mean = 0.0f;
+    float variance = 0.0f;
+    float local_sum = 0.0f;
+    float local_var_sum = 0.0f;
+
+    const int n_elems = hidden_dim / num_elems_T;
+    float_packed_t buf[pack_per_thread];
+    const T* cur_input = input + global_warp_id * n_elems;
+    T* cur_output = normed_output + global_warp_id * n_elems;
+
+    #pragma unroll
+    for (int i = 0; i < pack_per_thread; ++i) {
+        const int col = i * 32 + lane_id;
+        const T val = cur_input[col];
+        const float_packed_t val_f = cuda_cast<float_packed_t>(val);
+        buf[i] = val_f;
+
+        local_sum += cuda_sum<float>(val_f);
+        if (USE_DIFF_OF_SQUARES)
+        {
+            local_var_sum += cuda_sum<float>(val_f * val_f);
+        }
+    }
+
+    if (USE_DIFF_OF_SQUARES)
+    {
+        float packed[2] = {local_sum, local_var_sum};
+        warpReduceSumV2<float, 2>(packed);
+        mean = packed[0];
+        variance = packed[1];
+    }
+    else
+    {
+        mean = warpReduceSum(local_sum);
+    }
+
+    mean = mean / hidden_dim;
+    if (USE_DIFF_OF_SQUARES)
+    {
+        variance = max(0.f, (variance / hidden_dim) - (mean * mean)); // Var[x] = E[x²] - E[x]²
+        variance = rsqrtf(variance + eps);
+    }
+
+    if (!USE_DIFF_OF_SQUARES)
+    {
+        #pragma unroll
+        for (int i = 0; i < pack_per_thread; ++i) {
+            const float_packed_t diff = buf[i] - mean;
+            local_var_sum += cuda_sum<float>(diff * diff);
+        }
+        variance = warpReduceSum(local_var_sum);
+        variance = rsqrtf(variance / hidden_dim + eps);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < pack_per_thread; ++i) {
+        const int col = i * 32 + lane_id;
+        float_packed_t g = cuda_cast<float_packed_t>(__ldg(gamma + col));
+        float_packed_t b = cuda_cast<float_packed_t>(__ldg(beta + col));
+        const T val = cuda_cast<T>((buf[i] - mean) * variance * g + b);
+        cur_output[col] = val;
+    }
+}
+
+template <bool USE_DIFF_OF_SQUARES, typename T>
+void dispatch_layernorm_warp_type_square_method(const T* input, const T* gamma, const T* beta, T* normed_output,
+    const float eps, int tokens, int hidden_dim, cudaStream_t stream)
+{
+    assert(hidden_dim <= 1024 && hidden_dim % 64 == 0);
+    constexpr int block_size = 128;
+    constexpr int rows_per_block = block_size / 32;
+    dim3 block(32, rows_per_block);
+    const int grid = (tokens + rows_per_block - 1) / rows_per_block;
+#define SWITCH_CASE_FOR_LAYERNORM(N)                                                                                   \
+    case N:                                                                                                            \
+    {                                                                                                                  \
+        generalLayerNormWarp<T, N, USE_DIFF_OF_SQUARES><<<grid, block, 0, stream>>>(                                   \
+                input, gamma, beta, normed_output, eps, tokens, hidden_dim);                                           \
+        break;                                                                                                         \
+    }
+    switch (hidden_dim / 32) {
+        SWITCH_CASE_FOR_LAYERNORM(32);
+        SWITCH_CASE_FOR_LAYERNORM(30);
+        SWITCH_CASE_FOR_LAYERNORM(28);
+        SWITCH_CASE_FOR_LAYERNORM(26);
+        SWITCH_CASE_FOR_LAYERNORM(24);
+        SWITCH_CASE_FOR_LAYERNORM(22);
+        SWITCH_CASE_FOR_LAYERNORM(20);
+        SWITCH_CASE_FOR_LAYERNORM(18);
+        SWITCH_CASE_FOR_LAYERNORM(16);
+        SWITCH_CASE_FOR_LAYERNORM(14);
+        SWITCH_CASE_FOR_LAYERNORM(12);
+        SWITCH_CASE_FOR_LAYERNORM(10);
+        SWITCH_CASE_FOR_LAYERNORM(8);
+        SWITCH_CASE_FOR_LAYERNORM(6);
+        SWITCH_CASE_FOR_LAYERNORM(4);
+        SWITCH_CASE_FOR_LAYERNORM(2);
+        default: TLLM_THROW("generalLayerNormWrap not support hidden_dim = %d \n", hidden_dim);
+    }
+#undef SWITCH_CASE_FOR_LAYERNORM
 }
 
 /* Computes the layernorm https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
@@ -115,7 +253,7 @@ __global__ void generalLayerNorm(const T* input, const T* gamma, const T* beta, 
         s_mean = mean;
         if (USE_DIFF_OF_SQUARES)
         {
-            variance = (variance / hidden_dim) - (mean * mean); // Var[x] = E[x²] - E[x]²
+            variance = max(0.f, (variance / hidden_dim) - (mean * mean)); // Var[x] = E[x²] - E[x]²
             s_variance = rsqrtf(variance + eps);
         }
     }
@@ -235,12 +373,33 @@ void invokeGeneralLayerNorm(T* out, const T* input, const T* gamma, const T* bet
     const int hidden_dim, cudaStream_t stream, bool use_diff_of_squares, const float* scale, float* dynamic_scale,
     int8_t* normed_output_quant)
 {
+    constexpr size_t vec_size = 2;
+    const bool use_layer_norm_warp = (hidden_dim <= 1024 && hidden_dim % 64 == 0)
+        && (scale == nullptr) && (dynamic_scale == nullptr)
+        && (std::is_same<T, half>::value
+#ifdef ENABLE_BF16
+            || std::is_same<T, __nv_bfloat16>::value
+#endif
+        );
+    if (use_layer_norm_warp) {
+    // if (false) {
+        using Tp = typename packed_as<T, vec_size>::type;
+        if (use_diff_of_squares) {
+            return dispatch_layernorm_warp_type_square_method<true>(
+                reinterpret_cast<const Tp*>(input), reinterpret_cast<const Tp*>(gamma),
+                reinterpret_cast<const Tp*>(beta), reinterpret_cast<Tp*>(out), eps, tokens, hidden_dim, stream);
+        } else {
+            return dispatch_layernorm_warp_type_square_method<false>(
+                reinterpret_cast<const Tp*>(input), reinterpret_cast<const Tp*>(gamma),
+                reinterpret_cast<const Tp*>(beta), reinterpret_cast<Tp*>(out), eps, tokens, hidden_dim, stream);
+        }
+    }
+
     dim3 grid(tokens);
     dim3 block(min(hidden_dim, 1024));
     // Make sure block.x is multiple of 32 for warp shuffle to work
     block.x = 32 * ((block.x + 31) / 32);
 
-    constexpr size_t vec_size = 2;
     const size_t shmem_size = hidden_dim * sizeof(T);
     const bool use_vec_type = (hidden_dim % vec_size == 0)
         && (std::is_same<T, half>::value

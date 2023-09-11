@@ -130,8 +130,8 @@ class SamplingConfig:
     min_length: int = field(default=1)
     presence_penalty: float = field(default=0.0)
 
-    skip_step: int = field(default=8)
-    check_step: int = field(default=4)
+    skip_step: int = field(default=0)
+    check_step: int = field(default=1)
 
     ## None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
     ## The real default value is set in dynamicDecodeOp.cpp when it's None

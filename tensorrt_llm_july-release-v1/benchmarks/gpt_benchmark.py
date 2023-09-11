@@ -18,7 +18,7 @@ from tensorrt_llm.quantization import QuantMode
 class GPTBenchmark(BaseBenchmark):
 
     def __init__(self, engine_dir, model_name, mode, batch_sizes, in_out_lens,
-                 dtype, refit, num_beams, top_k, top_p, output_dir):
+                 dtype, refit, num_beams, top_k, top_p, output_dir, skip_step=0, check_step=1):
         super().__init__(engine_dir, model_name, dtype, output_dir)
         self.batch_sizes = batch_sizes
         self.in_out_lens = in_out_lens
@@ -106,7 +106,9 @@ class GPTBenchmark(BaseBenchmark):
                 pad_id=50256,
                 num_beams=num_beams,
                 top_k=top_k,
-                top_p=top_p)
+                top_p=top_p,
+                skip_step=skip_step,
+                check_step=check_step)
             self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
 

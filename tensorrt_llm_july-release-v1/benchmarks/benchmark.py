@@ -115,6 +115,16 @@ def parse_arguments():
         help=
         ('If this option is specified, instead of building engines on-air before benchmarking, '
          'the engines contained in the engine_dir will be used.'))
+    parser.add_argument(
+        '--skip_step',
+        type=int,
+        default=0,
+        help='Specify value of skip step')
+    parser.add_argument(
+        '--check_step',
+        type=int,
+        default=1,
+        help='Specify value of check step')
     return parser.parse_args()
 
 
@@ -148,7 +158,8 @@ def main(args):
         benchmarker = GPTBenchmark(args.engine_dir, args.model, args.mode,
                                    batch_size_options, in_out_len_options,
                                    args.dtype, args.refit, args.num_beams,
-                                   args.top_k, args.top_p, args.output_dir)
+                                   args.top_k, args.top_p, args.output_dir,
+                                   args.skip_step, args.check_step)
     elif args.model in ['bert_base', 'bert_large']:
         benchmarker = BERTBenchmark(args.engine_dir, args.model, args.mode,
                                     batch_size_options, input_len_options,

@@ -120,6 +120,49 @@ else:
 
 从表中可以看到，此方案减少的延迟与 output_len 相关，output_len 相同时无论 batch 多大，减少的延迟都是一致的。最终的效果是 output_len 越大减少的延迟越多，batch 越小加速比越大。
 
+#### 优化点2：优化 layer norm 的计算
+首先使用 nsys 来统计下在整个 pipeline 中不同 kernel 耗时占比。
+``` bash
+nsys profile -o gpt2_raw_v2 python benchmark.py -m gpt_350m --mode plugin --batch_size "1;8;64" --input_output_len "64,20;64,120" --engine_dir gpt2
+```
+从图中可以看出
+- 矩阵乘法占比较大，分散调用了不同的 kernel
+- attention 部分计算耗时占比我哦 21.6% 左右
+- tensorrt jit 生成的 elementwise（sum 及 gelu）操作占比 为 8.9%
+- layer norm 耗时占 6.4%
+
+![kernel 耗时占比](./docs/kernel_time.png)
+
+其中 layer norm 在 tensorrt_llm 中是通过插件来实现的，比较方便我们来进行修改优化。
+
+通过分析 layer norm kernel 源码可以发现有如下可以优化的点：
+- layer norm 的 block_size 参数设置有错误，源码中设置为 ```dim3 block(min(hidden_dim, 1024));```，但实际上在能做向量化计算时，应该设置为 ```dim3 block(min(hidden_dim / vec_size, 1024));```。GPT-medium 的 hidden_dim 为 1024。由于一个 sm 最多能同时运行 2048 个线程，如果 block 中线程数为 1024，则一个 sm 最多能同时运行 2 个 block。此时如果 block 中线程数能正确设置为 512，则一个 sm 最多能同时运行 4 个 block。A10 有 72 个 sm，在 tokens 数较多的 Tctx 阶段，错误的线程数设置对性能影响较大。
+- layer norm 的通用实现在 hidden dim 较小时性能不够好。layer norm 中使用一个 CTA 来计算一行的结果，并考虑了是否使用 shared memory。但在 hidden dim 为 1024 的场景，可以使用一个 warp 来计算一行的结果，直接使用寄存器来做缓存。
+- 在加载 gamma 和 beta 参数的时候可以使用 __ldg 来做 cache。
+
+基于此，我们针对 ```hidden_dim <= 1024``` 这种情况专门实现了一个优化版本的 kernel，使用一个 warp 来计算一行，并使用寄存器来缓存数据。
+
+加速效果 (skip=0, check=1)
+| (batch, input_len, output_len) | base | skip_8_check_4 | 加速比 |
+| ---- | ---- | ---- | ---- |
+| (1, 64, 20)| 51.72 | 51.79 | 0.998 |
+| (8, 64, 20)| 61.36 | 60.55 | 1.013 |
+| (64, 64, 20)| 146.05 | 141.47 | 1.032 |
+| (1, 128, 20)| 53.32 | 53.30 | 1.000 |
+| (8, 128, 20)| 71.47| 70.45 | 1.014 |
+| (64, 128, 20)| 222.42 | 213.79 | 1.040 |
+| (1, 64, 120)| 305.35 | 305.31 | 1.000 |
+| (8, 64, 120)| 345.49 | 345.42 | 1.000 |
+| (64, 64, 120)| 634.63 | 631.26 | 1.005 |
+| (1, 128, 120)| 312.75 | 313.06 | 0.999 |
+| (8, 128, 120)| 367.25| 366.26 | 1.003 |
+| (64, 128, 120)| 787.35 | 776.98 | 1.013 |
+
+可以看出，优化版本主要是优化了 Tctx 部分 batch 较大时的 layer norm 计算，在 Tgen 部分由于 tokens 较少，使用 warp 的方式计算时起的 block 数较少，相对使用 shared memory 时加速效果并不明显。
+
+![优化后占比](./docs/kernel_time_ln_warp.png)
+从统计到的耗时可以看出，layer norm 计算最大耗时从之前的 158us 降为 33us。
+
 ### 优化效果
 
 这一部分介绍你的工作在云主机上的运行效果。如果是优化模型，需要分两部分说明：
@@ -141,6 +184,7 @@ else:
 ### Bug报告（可选）
 
 - [TensorRT 在转换包含 Trilu 的 onnx 模型时可能会获得错误的结果](https://github.com/NVIDIA/trt-samples-for-hackathon-cn/issues/84)
+- [tensorrt_llm 中 layer norm 插件的 USE_DIFF_OF_SQUARES 实现可能导致结果出现 nan](https://github.com/NVIDIA/trt-samples-for-hackathon-cn/issues/88)
 
 ### 送分题答案（可选）
 
