@@ -323,9 +323,11 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             scales = tensorrt_llm_gpt.layers[i].mlp.fc.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
+            # tensorrt_llm_gpt.layers[
+            #     i].mlp.fc.weight.value = np.ascontiguousarray(
+            #         np.transpose(t, [1, 0]))
             tensorrt_llm_gpt.layers[
-                i].mlp.fc.weight.value = np.ascontiguousarray(
-                    np.transpose(t, [1, 0]))
+                i].mlp.fc.weight.value = np.ascontiguousarray(t)
         if bias:
             tensorrt_llm_gpt.layers[i].mlp.fc.bias.value = fromfile(
                 dir_path, 'model.layers.' + str(i) +
@@ -481,10 +483,10 @@ def load_from_hf_gpt(tensorrt_llm_gpt: GPTLMHeadModel,
                 dst = tensorrt_llm_gpt.layers[idx].post_layernorm.bias
                 dst.value = v
             elif 'mlp.c_fc.weight' in k:
-                v = v.transpose()
+                # v = v.transpose()
                 tensorrt_llm_gpt.layers[
                     idx].mlp.fc.weight.value = np.ascontiguousarray(
-                        split(v, tensor_parallel, rank))
+                        split(v, tensor_parallel, rank, dim=1))
             elif 'mlp.c_fc.bias' in k:
                 tensorrt_llm_gpt.layers[
                     idx].mlp.fc.bias.value = np.ascontiguousarray(

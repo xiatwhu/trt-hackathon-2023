@@ -3393,6 +3393,19 @@ ACT2FN = {
     'fast-swiglu': swiglu,
 }
 
+ACT2INT = {
+    'relu': 0,
+    'tanh': 1,
+    'gelu': 2,
+    'gelu_new': 2,
+    'gelu_fast': 2,
+    'geglu': 3,
+    'silu': 4,
+    'softplus': 5,
+    'swiglu': 6,
+    'fast-swiglu': 6,
+}
+
 GATED_ACT_2_ACT = {
     'swiglu': 'silu',
     'fast-swiglu': 'silu',

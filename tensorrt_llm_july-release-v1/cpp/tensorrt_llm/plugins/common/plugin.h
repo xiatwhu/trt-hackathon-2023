@@ -22,6 +22,7 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cudnn.h>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -186,6 +187,7 @@ std::map<std::set<int>, ncclComm_t>* getCommMap();
 //! Get cublas and cublasLt handle for current cuda context
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
+std::shared_ptr<cudnnHandle_t> getCudnnHandle();
 
 #ifndef DEBUG
 

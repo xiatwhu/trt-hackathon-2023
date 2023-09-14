@@ -18,6 +18,7 @@ namespace tensorrt_llm::common
 
 // workspace for cublas gemm : 32MB
 #define CUBLAS_WORKSPACE_SIZE 33554432
+#define CUDNN_WORKSPACE_SIZE (CUBLAS_WORKSPACE_SIZE * 10)
 
 typedef struct __align__(4)
 {

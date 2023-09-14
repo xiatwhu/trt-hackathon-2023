@@ -36,6 +36,7 @@ set(PLUGIN_LISTS
     identityPlugin
     layernormPlugin
     gemmPlugin
+    gemmBiasActPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin

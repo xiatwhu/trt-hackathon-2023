@@ -122,7 +122,8 @@ find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
 
 set(3RDPARTY_DIR ../3rdparty)
 include_directories(${CUDA_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include
-                    ${NCCL_INCLUDE_DIR} ${3RDPARTY_DIR}/cutlass/include)
+                    ${NCCL_INCLUDE_DIR} ${3RDPARTY_DIR}/cutlass/include
+                    ${3RDPARTY_DIR}/cudnn-frontend/include)
 
 # TRT dependencies
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})

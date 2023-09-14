@@ -141,6 +141,23 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
     return creator();
 }
 
+std::shared_ptr<cudnnHandle_t> getCudnnHandle()
+{
+    static PerCudaCtxSingletonCreator<cudnnHandle_t> creator(
+        []() -> auto
+        {
+            auto handle = std::unique_ptr<cudnnHandle_t>(new cudnnHandle_t);
+            PLUGIN_CUBLASASSERT(cudnnCreate(handle.get()));
+            return handle;
+        },
+        [](cudnnHandle_t* handle)
+        {
+            PLUGIN_CUBLASASSERT(cudnnDestroy(*handle));
+            delete handle;
+        });
+    return creator();
+}
+
 // ALIGNPTR
 int8_t* nvinfer1::plugin::alignPtr(int8_t* ptr, uintptr_t to)
 {
