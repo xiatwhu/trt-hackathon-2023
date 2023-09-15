@@ -60,6 +60,33 @@ def _gemm_bias_act_plugin(input: Tensor,
     layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_bias_act_plug)
     return _create_tensor(layer.get_output(0), layer)
 
+def _gemm_bias_res_plugin(input: Tensor,
+                          w: Tensor,
+                          z: Tensor,
+                          bias: Optional[Tensor] = None,
+                          beta: float = 1.0) -> Tensor:
+
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'GemmBiasRes', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    has_bias = trt.PluginField("has_bias", np.array(0 if bias is None else 1, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    beta_f = trt.PluginField("beta", np.array(beta, dtype=np.float32),
+                             trt.PluginFieldType.FLOAT32)
+    p_dtype = default_net().plugin_config.gemm_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([has_bias, beta_f, pf_type])
+    gemm_bias_act_plug = plg_creator.create_plugin("gemm_bias_res", pfc)
+    plug_inputs = [input.trt_tensor, w.trt_tensor]
+    if bias is not None:
+        plug_inputs.append(bias.trt_tensor)
+    plug_inputs.append(z.trt_tensor)
+    layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_bias_act_plug)
+    return _create_tensor(layer.get_output(0), layer)
+
 
 class Linear(Module):
 
@@ -205,5 +232,52 @@ class RowLinear(Module):
 
         if self.bias is not None:
             x = x + self.bias.value
+
+        return x
+
+
+class RowResidualLinear(Module):
+
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1):
+        super().__init__()
+        self.in_features = in_features // tp_size
+        self.out_features = out_features
+        self.dtype = dtype
+
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype=dtype)
+
+        if bias:
+            self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
+        else:
+            self.register_parameter('bias', None)
+
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+
+    def forward(self, x, z):
+        if default_net().plugin_config.gemm_plugin:
+            x = _gemm_bias_res_plugin(x, self.weight.value, z,
+                                      self.bias.value,
+                                      1.0 / self.tp_size)
+
+            if self.tp_size > 1 and self.tp_group is not None:
+                x = allreduce(x, self.tp_group)
+        else:
+            x = matmul(x, self.weight.value, transb=True)
+
+            if self.tp_size > 1 and self.tp_group is not None:
+                x = allreduce(x, self.tp_group)
+
+            if self.bias is not None:
+                x = x + self.bias.value
+
+            x = x + z
 
         return x

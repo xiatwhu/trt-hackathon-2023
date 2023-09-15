@@ -8,8 +8,8 @@ from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (RaggedTensor, Tensor, assertion, expand_mask,
                            gather_last_token_logits, is_gated_activation,
                            non_gated_version, shape)
-from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, InflightBatchingParam, LayerNorm,
+from ...layers import (MLP, MLPRes, Attention, AttentionRes, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, GatedMLPRes, InflightBatchingParam, LayerNorm,
                        PositionEmbeddingType, PromptTuningEmbedding)
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -22,7 +22,7 @@ def MLPFactory(hidden_size,
                dtype=None,
                tp_group=None,
                tp_size=1):
-    MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
+    MLPClass = GatedMLPRes if is_gated_activation(hidden_act) else MLPRes
     hidden_act = non_gated_version(hidden_act)
     return MLPClass(hidden_size, ffn_hidden_size, hidden_act, bias, dtype,
                     tp_group, tp_size)
@@ -106,7 +106,7 @@ class GPTDecoderLayer(Module):
         self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
                                          dtype=dtype)
 
-        self.attention = Attention(
+        self.attention = AttentionRes(
             hidden_size,
             num_attention_heads,
             max_position_embeddings,
@@ -171,19 +171,20 @@ class GPTDecoderLayer(Module):
             cache_indirection=cache_indirection,
             kv_cache_block_pointers=kv_cache_block_pointers,
             inflight_batching_args=inflight_batching_args,
-            past_key_value_pointers=past_key_value_pointers)
+            past_key_value_pointers=past_key_value_pointers,
+            z=residual)
 
         if use_cache:
             attention_output, presents = attention_output
 
-        hidden_states = residual + attention_output.data
+        hidden_states = attention_output.data
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, residual)
 
-        hidden_states = residual + hidden_states
+        # hidden_states = residual + hidden_states
         hidden_states = RaggedTensor.from_row_lengths(hidden_states,
                                                       input_lengths,
                                                       max_input_length)

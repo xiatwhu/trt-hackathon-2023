@@ -14,8 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_GEMM_BIAS_ACT_PLUGIN_H
-#define TRT_GEMM_BIAS_ACT_PLUGIN_H
+#ifndef TRT_GEMM_BIAS_RES_PLUGIN_H
+#define TRT_GEMM_BIAS_RES_PLUGIN_H
 #include "NvInferPlugin.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
@@ -28,16 +28,16 @@ namespace nvinfer1
 namespace plugin
 {
 
-class GemmBiasActPlugin : public IPluginV2DynamicExt
+class GemmBiasResPlugin : public IPluginV2DynamicExt
 {
 public:
-    GemmBiasActPlugin() = delete;
+    GemmBiasResPlugin() = delete;
 
-    GemmBiasActPlugin(int hasBias, int activation, nvinfer1::DataType type);
+    GemmBiasResPlugin(int hasBias, float beta, nvinfer1::DataType type);
 
-    GemmBiasActPlugin(const void* data, size_t length);
+    GemmBiasResPlugin(const void* data, size_t length);
 
-    ~GemmBiasActPlugin() override = default;
+    ~GemmBiasResPlugin() override = default;
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
@@ -73,15 +73,15 @@ private:
     std::string mNamespace;
     std::shared_ptr<cudnnHandle_t> mHandle;
 
-    int mActivation;
+    float mBeta;
     int mHasBias;
     nvinfer1::DataType mType;
 };
 
-class GemmBiasActPluginCreator : public IPluginCreator
+class GemmBiasResPluginCreator : public IPluginCreator
 {
 public:
-    GemmBiasActPluginCreator();
+    GemmBiasResPluginCreator();
 
     const char* getPluginName() const noexcept override;
 
@@ -107,4 +107,4 @@ private:
 } // namespace plugin
 } // namespace nvinfer1
 
-#endif // TRT_GEMM_BIAS_ACT_PLUGIN_H
+#endif // TRT_GEMM_BIAS_RES_PLUGIN_H

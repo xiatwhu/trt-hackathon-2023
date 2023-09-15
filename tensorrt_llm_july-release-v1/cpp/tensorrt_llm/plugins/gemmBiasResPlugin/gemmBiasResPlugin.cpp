@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/gemmBiasActPlugin/gemmBiasActPlugin.h"
+#include "tensorrt_llm/plugins/gemmBiasResPlugin/gemmBiasResPlugin.h"
 #include "tensorrt_llm/common/paramsHash.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "cudnn_frontend.h"
@@ -23,13 +23,13 @@
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
-using nvinfer1::plugin::GemmBiasActPluginCreator;
-using nvinfer1::plugin::GemmBiasActPlugin;
+using nvinfer1::plugin::GemmBiasResPluginCreator;
+using nvinfer1::plugin::GemmBiasResPlugin;
 
-static const char* GEMM_BIAS_ACT_PLUGIN_VERSION{"1"};
-static const char* GEMM_BIAS_ACT_PLUGIN_NAME{"GemmBiasAct"};
-PluginFieldCollection GemmBiasActPluginCreator::mFC{};
-std::vector<PluginField> GemmBiasActPluginCreator::mPluginAttributes;
+static const char* GEMM_BIAS_RES_PLUGIN_VERSION{"1"};
+static const char* GEMM_BIAS_RES_PLUGIN_NAME{"GemmBiasRes"};
+PluginFieldCollection GemmBiasResPluginCreator::mFC{};
+std::vector<PluginField> GemmBiasResPluginCreator::mPluginAttributes;
 
 namespace {
 
@@ -37,7 +37,6 @@ struct CacheKey {
     int M;
     int N;
     int K;
-    int activation;
     int has_bias;
 };
 
@@ -65,12 +64,25 @@ struct BenchmarkCache {
 BenchmarkCache engine_cache;
 
 cudnn_frontend::Tensor getTensorDescriptor(int row, int col, char id, cudnnDataType_t dataType, bool isVirtual = false) {
+#if 0
     int64_t dims[] = {1, row, col};
     int64_t strides[] = {row * col, col, 1};
 
     auto tensor = cudnn_frontend::TensorBuilder()
                 .setDim(3, dims)
                 .setStride(3, strides)
+                .setId(id)
+                .setVirtual(isVirtual)
+                .setAlignment(16)
+                .setDataType(dataType)
+                .build();
+#endif
+    int64_t dims[] = {row, col, 1, 1};
+    int64_t strides[] = {col, 1, col, col};
+
+    auto tensor = cudnn_frontend::TensorBuilder()
+                .setDim(4, dims)
+                .setStride(4, strides)
                 .setId(id)
                 .setVirtual(isVirtual)
                 .setAlignment(16)
@@ -92,54 +104,49 @@ bool getEnvValue(const char* key, bool defaultVal) {
 
 }  // namespace
 
-GemmBiasActPlugin::GemmBiasActPlugin(int hasBias, int activation, nvinfer1::DataType type)
+GemmBiasResPlugin::GemmBiasResPlugin(int hasBias, float beta, nvinfer1::DataType type)
     : mHasBias(hasBias)
-    , mActivation(activation)
+    , mBeta(beta)
     , mType(type)
 {
 }
 
 // Parameterized constructor
-GemmBiasActPlugin::GemmBiasActPlugin(const void* data, size_t length)
+GemmBiasResPlugin::GemmBiasResPlugin(const void* data, size_t length)
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mHasBias);
-    read(d, mActivation);
+    read(d, mBeta);
     read(d, mType);
     PLUGIN_ASSERT(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
-nvinfer1::IPluginV2DynamicExt* GemmBiasActPlugin::clone() const noexcept
+nvinfer1::IPluginV2DynamicExt* GemmBiasResPlugin::clone() const noexcept
 {
-    auto* plugin = new GemmBiasActPlugin(*this);
+    auto* plugin = new GemmBiasResPlugin(*this);
     plugin->setPluginNamespace(mNamespace.c_str());
     plugin->initialize();
     return plugin;
 }
 
-nvinfer1::DimsExprs GemmBiasActPlugin::getOutputDimensions(
+nvinfer1::DimsExprs GemmBiasResPlugin::getOutputDimensions(
     int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     try
     {
-        // A * B + bias
-        PLUGIN_ASSERT(nbInputs == 2 || nbInputs == 3);
+        // A * B + bias + X
+        PLUGIN_ASSERT(nbInputs == 3 || nbInputs == 4);
         PLUGIN_ASSERT(outputIndex == 0);
-        const int nbDimsA = inputs[0].nbDims;
-        const int nbDimsB = inputs[1].nbDims;
+
+        const int nbDimsX = inputs[nbInputs - 1].nbDims;
         DimsExprs ret;
-        ret.nbDims = nbDimsA + nbDimsB - 2;
+        ret.nbDims = nbDimsX;
 
-        for (int i = 0; i < nbDimsA - 1; ++i)
-        {
-            ret.d[i] = inputs[0].d[i];
+        for (int i = 0; i < nbDimsX; ++i) {
+            ret.d[i] = inputs[nbInputs - 1].d[i];
         }
 
-        for (int i = 1; i < nbDimsB; ++i)
-        {
-            ret.d[nbDimsA - 2 + i] = inputs[1].d[i];
-        }
         return ret;
     }
     catch (const std::exception& e)
@@ -149,67 +156,62 @@ nvinfer1::DimsExprs GemmBiasActPlugin::getOutputDimensions(
     return DimsExprs{};
 }
 
-bool GemmBiasActPlugin::supportsFormatCombination(
+bool GemmBiasResPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
     return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
 
-void GemmBiasActPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+void GemmBiasResPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
 }
 
-size_t GemmBiasActPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
+size_t GemmBiasResPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
     const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
 {
     return CUDNN_WORKSPACE_SIZE;
 }
 
-int GemmBiasActPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
+int GemmBiasResPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     // inputs
     //     x [B, T, K]
     //     w [K, N]
     //     b [1, N] (optional)
+    //     z [B, T, N]
     // outputs
     //     y [B, T, N]
-
-    // TODO
-    // (1) only support fp16 now, support int8 / bfloat16 / float32
-    // (2) only support gelu now, support other activation
 
     cudnnHandle_t cudnnHandle = *mHandle;
     PLUGIN_CUDNNASSERT(cudnnSetStream(cudnnHandle, stream));
 
     const int nbDimsA = inputDesc[0].dims.nbDims;
-    const int nbDimsB = inputDesc[1].dims.nbDims;
-    int M = 1, N = 1;
+    int M = 1;
     const int K = inputDesc[0].dims.d[nbDimsA - 1];
     for (int i = 0; i < nbDimsA - 1; ++i)
     {
         M *= inputDesc[0].dims.d[i];
     }
 
-    for (int i = nbDimsB - 1; i > 0; --i)
-    {
-        N *= inputDesc[1].dims.d[i];
-    }
+    const int zIndex = mHasBias ? 3 : 2;
+    const int nbDimsZ = inputDesc[zIndex].dims.nbDims;
+    const int N = inputDesc[zIndex].dims.d[nbDimsZ - 1];
 
     CacheKey key;
     key.M = M;
     key.N = N;
     key.K = K;
-    key.activation = mActivation;
     key.has_bias = mHasBias;
 
     int has_bias = mHasBias;
     auto run = [&](cudnn_frontend::ExecutionPlan* plan) -> cudnnStatus_t {
         std::vector<void*> data_ptrs = {const_cast<void*>(inputs[0]),
                                         const_cast<void*>(inputs[1]),
+                                        const_cast<void*>(inputs[has_bias ? 3 : 2]),
                                         outputs[0]};
-        std::vector<int64_t> uids = {'x', 'w', 'y'};
+        std::vector<int64_t> uids = {'x', 'w', 'z', 'y'};
         if (has_bias) {
             data_ptrs.push_back(const_cast<void*>(inputs[2]));
             uids.push_back('b');
@@ -233,53 +235,75 @@ int GemmBiasActPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, cons
 
     auto xTensor = getTensorDescriptor(M, K, 'x', CUDNN_DATA_HALF);
     auto yTensor = getTensorDescriptor(M, N, 'y', CUDNN_DATA_HALF);
-    auto wTensor = getTensorDescriptor(K, N, 'w', CUDNN_DATA_HALF);
+    auto wTensor = getTensorDescriptor(N, K, 'w', CUDNN_DATA_HALF);
     auto bTensor = getTensorDescriptor(1, N, 'b', CUDNN_DATA_HALF);
+    auto zTensor = getTensorDescriptor(M, N, 'z', CUDNN_DATA_HALF);
 
-    auto afterMatMulTensor = getTensorDescriptor(M, N, 'A', CUDNN_DATA_HALF, true);
-    auto afterBiasTensor = getTensorDescriptor(M, N, 'B', CUDNN_DATA_HALF, true);
+    auto afterMatMulTensor = getTensorDescriptor(M, N, 'A', CUDNN_DATA_FLOAT, true);
+    auto afterAddTensor = getTensorDescriptor(M, N, 'B', CUDNN_DATA_FLOAT, true);
 
+#if 0
     auto matmulDesc = cudnn_frontend::MatMulDescBuilder()
                 .setComputeType(CUDNN_DATA_HALF)
+                .build();
+#endif
+    int64_t pad[] = {0, 0};
+    int64_t stride[] = {1, 1};
+    int64_t dilation[] = {1, 1};
+    auto convDesc = cudnn_frontend::ConvDescBuilder()
+                .setComputeType(CUDNN_DATA_FLOAT)
+                .setMathMode(CUDNN_CONVOLUTION)
+                .setSpatialDimCount(2)
+                .setSpatialStride(2, stride)
+                .setPrePadding(2, pad)
+                .setPostPadding(2, pad)
+                .setDilation(2, dilation)
                 .build();
 
     auto biasDesc = cudnn_frontend::PointWiseDescBuilder()
                 .setMode(CUDNN_POINTWISE_ADD)
-                .setComputeType(CUDNN_DATA_FLOAT)
+                .setMathPrecision(CUDNN_DATA_FLOAT)
                 .build();
-    auto actDesc = cudnn_frontend::PointWiseDescBuilder()
-#if (CUDNN_VERSION >= 8500)
-                .setMode(CUDNN_POINTWISE_GELU_APPROX_TANH_FWD)
-#else
-                .setMode(CUDNN_POINTWISE_GELU_FWD)
-#endif
-                .setComputeType(CUDNN_DATA_FLOAT)
+    auto resDesc = cudnn_frontend::PointWiseDescBuilder()
+                .setMode(CUDNN_POINTWISE_ADD)
+                .setMathPrecision(CUDNN_DATA_FLOAT)
                 .build();
 
-    auto matmulOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR)
-                .setaMatDesc(xTensor)
-                .setbMatDesc(wTensor)
-                .setcMatDesc(afterMatMulTensor)
-                .setmatmulDesc(matmulDesc)
+    // std::cout << xTensor.describe() << std::endl;
+    // std::cout << wTensor.describe() << std::endl;
+    // std::cout << convDesc.describe() << std::endl;
+    // std::cout << afterMatMulTensor.describe() << std::endl;
+    // std::cout << afterAddTensor.describe() << std::endl;
+    auto matmulOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)
+                .setxDesc(xTensor)
+                .setwDesc(wTensor)
+                .setyDesc(afterMatMulTensor)
+                .setcDesc(convDesc)
+                .setAlpha(1.0f)
+                .setBeta(0.f)
                 .build();
-
-    auto biasOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
+    auto resOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
                 .setxDesc(matmulOp.getOutputTensor())
+                .setbDesc(zTensor)
+                .setyDesc(afterAddTensor)
+                .setpwDesc(resDesc)
+                .setAlpha(1.f)
+                .setAlpha2(mBeta)
+                .build();
+    auto biasOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
+                .setxDesc(resOp.getOutputTensor())
                 .setbDesc(bTensor)
-                .setyDesc(afterBiasTensor)
-                .setpwDesc(biasDesc)
-                .build();
-    auto actOp = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
-                .setxDesc(mHasBias ? biasOp.getOutputTensor() : matmulOp.getOutputTensor())
                 .setyDesc(yTensor)
-                .setpwDesc(actDesc)
+                .setpwDesc(biasDesc)
+                .setAlpha(1.f)
+                .setAlpha2(mBeta)
                 .build();
-    
+
     std::vector<cudnn_frontend::Operation const*> ops = {&matmulOp};
     if (mHasBias) {
         ops.push_back(&biasOp);
     }
-    ops.push_back(&actOp);
+    ops.push_back(&resOp);
     auto opGraph = cudnn_frontend::OperationGraphBuilder()
                 .setHandle(cudnnHandle)
                 .setOperationGraph(ops.size(), ops.data())
@@ -325,7 +349,7 @@ int GemmBiasActPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, cons
             }
             std::sort(times.begin(), times.end());
 
-            // printf("gemmBiasAct: %d %d %d %d %fms\n", M, N, K, n, times[5]);
+            // printf("gemmBiasRes: %d %d %d %d %fms\n", M, N, K, n, times[5]);
             if (times.size() > 0 && times[5] < best_time) {
                 best_time = times[5];
                 best_cfg_index = n;
@@ -347,7 +371,7 @@ int GemmBiasActPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, cons
 }
 
 // IPluginV2Ext Methods
-nvinfer1::DataType GemmBiasActPlugin::getOutputDataType(
+nvinfer1::DataType GemmBiasResPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
     PLUGIN_ASSERT(index == 0);
@@ -356,90 +380,91 @@ nvinfer1::DataType GemmBiasActPlugin::getOutputDataType(
 
 // IPluginV2 Methods
 
-const char* GemmBiasActPlugin::getPluginType() const noexcept
+const char* GemmBiasResPlugin::getPluginType() const noexcept
 {
-    return GEMM_BIAS_ACT_PLUGIN_NAME;
+    return GEMM_BIAS_RES_PLUGIN_NAME;
 }
 
-const char* GemmBiasActPlugin::getPluginVersion() const noexcept
+const char* GemmBiasResPlugin::getPluginVersion() const noexcept
 {
-    return GEMM_BIAS_ACT_PLUGIN_VERSION;
+    return GEMM_BIAS_RES_PLUGIN_VERSION;
 }
 
-int GemmBiasActPlugin::getNbOutputs() const noexcept
+int GemmBiasResPlugin::getNbOutputs() const noexcept
 {
     return 1;
 }
 
-int GemmBiasActPlugin::initialize() noexcept
+int GemmBiasResPlugin::initialize() noexcept
 {
     mHandle = getCudnnHandle();
     return 0;
 }
 
-void GemmBiasActPlugin::destroy() noexcept
+void GemmBiasResPlugin::destroy() noexcept
 {
     delete this;
 }
 
-size_t GemmBiasActPlugin::getSerializationSize() const noexcept
+size_t GemmBiasResPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mHasBias) + sizeof(mActivation) + sizeof(mType);
+    return sizeof(mHasBias) + sizeof(mBeta) + sizeof(mType);
 }
 
-void GemmBiasActPlugin::serialize(void* buffer) const noexcept
+void GemmBiasResPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mHasBias);
-    write(d, mActivation);
+    write(d, mBeta);
     write(d, mType);
     assert(d == a + getSerializationSize());
 }
 
-void GemmBiasActPlugin::terminate() noexcept {}
+void GemmBiasResPlugin::terminate() noexcept {}
 
-void GemmBiasActPlugin::setPluginNamespace(const char* libNamespace) noexcept
+void GemmBiasResPlugin::setPluginNamespace(const char* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-const char* GemmBiasActPlugin::getPluginNamespace() const noexcept
+const char* GemmBiasResPlugin::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
 ///////////////
 
-GemmBiasActPluginCreator::GemmBiasActPluginCreator()
+GemmBiasResPluginCreator::GemmBiasResPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("has_bias", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("activation", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("beta", nullptr, PluginFieldType::kFLOAT32, 0));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
 
-const char* GemmBiasActPluginCreator::getPluginName() const noexcept
+const char* GemmBiasResPluginCreator::getPluginName() const noexcept
 {
-    return GEMM_BIAS_ACT_PLUGIN_NAME;
+    return GEMM_BIAS_RES_PLUGIN_NAME;
 }
 
-const char* GemmBiasActPluginCreator::getPluginVersion() const noexcept
+const char* GemmBiasResPluginCreator::getPluginVersion() const noexcept
 {
-    return GEMM_BIAS_ACT_PLUGIN_VERSION;
+    return GEMM_BIAS_RES_PLUGIN_VERSION;
 }
 
-const PluginFieldCollection* GemmBiasActPluginCreator::getFieldNames() noexcept
+const PluginFieldCollection* GemmBiasResPluginCreator::getFieldNames() noexcept
 {
     return &mFC;
 }
 
-IPluginV2* GemmBiasActPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
+IPluginV2* GemmBiasResPluginCreator::createPlugin(const char* name, const PluginFieldCollection* fc) noexcept
 {
     const PluginField* fields = fc->fields;
-    int has_bias, activation;
+    int has_bias = 1;
+    float beta = 1.f;
     nvinfer1::DataType type;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -450,10 +475,10 @@ IPluginV2* GemmBiasActPluginCreator::createPlugin(const char* name, const Plugin
             PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
             has_bias = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
-        else if (!strcmp(attrName, "activation"))
+        else if (!strcmp(attrName, "beta"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
-            activation = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kFLOAT32);
+            beta = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
@@ -463,7 +488,7 @@ IPluginV2* GemmBiasActPluginCreator::createPlugin(const char* name, const Plugin
     }
     try
     {
-        auto* obj = new GemmBiasActPlugin(has_bias, activation, type);
+        auto* obj = new GemmBiasResPlugin(has_bias, beta, type);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -474,13 +499,13 @@ IPluginV2* GemmBiasActPluginCreator::createPlugin(const char* name, const Plugin
     return nullptr;
 }
 
-IPluginV2* GemmBiasActPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept
+IPluginV2* GemmBiasResPluginCreator::deserializePlugin(const char* name, const void* serialData, size_t serialLength) noexcept
 {
     // This object will be deleted when the network is destroyed, which will
-    // call GemmBiasActPlugin::destroy()
+    // call GemmBiasResPlugin::destroy()
     try
     {
-        auto* obj = new GemmBiasActPlugin(serialData, serialLength);
+        auto* obj = new GemmBiasResPlugin(serialData, serialLength);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -491,12 +516,12 @@ IPluginV2* GemmBiasActPluginCreator::deserializePlugin(const char* name, const v
     return nullptr;
 }
 
-void GemmBiasActPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
+void GemmBiasResPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-const char* GemmBiasActPluginCreator::getPluginNamespace() const noexcept
+const char* GemmBiasResPluginCreator::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmBiasActPlugin/gemmBiasActPlugin.h"
+#include "tensorrt_llm/plugins/gemmBiasResPlugin/gemmBiasResPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 #include "tensorrt_llm/plugins/ibGptAttentionPlugin/ibGptAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
@@ -157,6 +158,7 @@ extern "C"
         nvinfer1::initializePlugin<nvinfer1::plugin::IBGPTAttentionPluginCreator>(logger, libNamespace);
         nvinfer1::initializePlugin<nvinfer1::plugin::GemmPluginCreator>(logger, libNamespace);
         nvinfer1::initializePlugin<nvinfer1::plugin::GemmBiasActPluginCreator>(logger, libNamespace);
+        nvinfer1::initializePlugin<nvinfer1::plugin::GemmBiasResPluginCreator>(logger, libNamespace);
         nvinfer1::initializePlugin<nvinfer1::plugin::SendPluginCreator>(logger, libNamespace);
         nvinfer1::initializePlugin<nvinfer1::plugin::RecvPluginCreator>(logger, libNamespace);
         nvinfer1::initializePlugin<nvinfer1::plugin::AllreducePluginCreator>(logger, libNamespace);

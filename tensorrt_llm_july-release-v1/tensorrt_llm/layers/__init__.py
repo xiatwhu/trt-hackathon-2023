@@ -1,11 +1,11 @@
 from .activation import Mish
 from .attention import (Attention, AttentionMaskType, InflightBatchingParam,
-                        PositionEmbeddingType)
+                        PositionEmbeddingType, AttentionRes)
 from .cast import Cast
 from .conv import Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
 from .linear import ColumnLinear, Linear, RowLinear
-from .mlp import MLP, GatedMLP
+from .mlp import MLP, GatedMLP, MLPRes, GatedMLPRes
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 
@@ -18,6 +18,7 @@ __all__ = [
     'AttentionMaskType',
     'PositionEmbeddingType',
     'Attention',
+    'AttentionRes',
     'InflightBatchingParam',
     'GroupNorm',
     'Embedding',
@@ -28,5 +29,7 @@ __all__ = [
     'Mish',
     'MLP',
     'GatedMLP',
+    'MLPRes',
+    'GatedMLPRes',
     'Cast',
 ]
