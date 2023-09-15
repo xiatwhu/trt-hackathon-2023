@@ -143,7 +143,7 @@ nsys profile -o gpt2_raw_v2 python benchmark.py -m gpt_350m --mode plugin --batc
 基于此，我们针对 ```hidden_dim <= 1024``` 这种情况专门实现了一个优化版本的 kernel，使用一个 warp 来计算一行，并使用寄存器来缓存数据。
 
 加速效果 (skip=0, check=1)
-| (batch, input_len, output_len) | base | skip_8_check_4 | 加速比 |
+| (batch, input_len, output_len) | base | layer_norm_opt | 加速比 |
 | ---- | ---- | ---- | ---- |
 | (1, 64, 20)| 51.72 | 51.79 | 0.998 |
 | (8, 64, 20)| 61.36 | 60.55 | 1.013 |
@@ -163,23 +163,92 @@ nsys profile -o gpt2_raw_v2 python benchmark.py -m gpt_350m --mode plugin --batc
 ![优化后占比](./docs/kernel_time_ln_warp.png)
 从统计到的耗时可以看出，layer norm 计算最大耗时从之前的 158us 降为 33us。
 
+#### 优化点3：合并计算减少 elementwise 计算开销
+在 FasterTransformer 中可以看到将各类 elementwise 操作进行了合并，但这样的合并在 tensorrt-llm 中并不容易集成。
+![block 计算逻辑](./docs/block.png)
+
+观察上图中 GPT 一个 block 的计算逻辑调用的 kernel，可以发现 TensorRT 以及自动合并了一些 elementwise 操作，更进一步的，我们能否将这些操作和 GEMM 合并起来呢。通过观察，我们发现在 GPT 计算中包含两种计算模式：
+- 图中橙色圈: GEMM + AddBias + Residual
+- 图中绿色圈: GEMM + AddBias + GeLU
+
+通过合并这些计算，有可能进一步减少 elementwise 操作的时间。在探索过程中，我们调研了 [cutlass](https://github.com/NVIDIA/cutlass) 和 [cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend) 两种方案。在 cutlass 中通过添加 EpilogueOp 来在矩阵乘法之后做一些 elementwise 的操作。但在单测时发现有一些尺寸，不管设置怎样的 ```ThreadblockShape```、```WarpShape```、```InstructionShape``` 都没有拆分成两个 kernel 快。基于此选择了实测性能更好的 cudnn-frontend 方案。我们开发了两个 TensorRT 插件：
+- GemmBiasAct：实现 GEMM + AddBias + GeLU 逻辑，由于 cudnn-frontend 中 ```MatMul``` 操作不支持设置 transpose，所以在模型导出和加载时 ```mlp.c_fc.weight``` 需要做一些转置的修改。另外 cudnn-frontend 需要先 build 生成 plan，执行时再用具体的数据来执行 plan，由于 build 耗时比较长，在代码中需要缓存不同参数的 plan。
+- GemmBiasRes：实现了 GEMM + AddBias + Residual 逻辑。按照 GemmBiasAct 的思路来实现，但在实测中发现性能比 base 版本慢了很多，原因在于 base 版本在计算小尺寸 GEMM 的时候采用了 splitK 方案，比 cudnn 中的 GEMM 快很多。基于此我们将 ```MatMul``` 操作替换成了一个 1*1 的 ```Conv``` 操作，测试下来速度比 base 版本更快。cudnn 中并没有支持 Conv 与 GeLU 的融合，所以 GemmBiasAct 中继续采用 ```MatMul```。
+
+![block fuse](./docs/block_fuse.png)
+对比上图中 block 内的计算与 base 版本的计算可以发现优化后的版本能有效减少 elementwise 操作的开销。
+
+加速效果 (skip=0, check=1, 关闭 layer norm 加速)
+| (batch, input_len, output_len) | base | cudnn-frontend | 加速比 |
+| ---- | ---- | ---- | ---- |
+| (1, 64, 20)| 51.72 | 48.81 | 1.060 |
+| (8, 64, 20)| 61.36 | 57.74 | 1.063 |
+| (64, 64, 20)| 146.05 | 137.44 | 1.063 |
+| (1, 128, 20)| 53.32 | 50.27 | 1.061 |
+| (8, 128, 20)| 71.47| 67.19 | 1.064 |
+| (64, 128, 20)| 222.42 | 209.82 | 1.060 |
+| (1, 64, 120)| 305.35 | 288.35 | 1.059 |
+| (8, 64, 120)| 345.49 | 323.76 | 1.067 |
+| (64, 64, 120)| 634.63 | 617.25 | 1.028 |
+| (1, 128, 120)| 312.75 | 296.34 | 1.055 |
+| (8, 128, 120)| 367.25| 346.82 | 1.059 |
+| (64, 128, 120)| 787.35 | 764.64 | 1.030 |
+
 ### 优化效果
 
 这一部分介绍你的工作在云主机上的运行效果。如果是优化模型，需要分两部分说明：
 
-- 精度：报告与原始模型进行精度对比测试的结果，验证精度达标。
-  - 如果选用TensorRT-LLM，请跑summarize任务并使用 [Rouge](https://huggingface.co/spaces/evaluate-metric/rouge) 来对比模型优化前后的精度差距。如果精度良好，原始模型与优化模型的Rouge score的差异一般在1以内。例子见 TensorRT-LLM docker 中 /root/workspace/tensorrt_llm_july-release-v1/examples/gpt/summarize.py
-  - 如果选用TensorRT，这里的精度测试指的是针对“原始模型”和“TensorRT优化模型”分别输出的数据（tensor）进行数值比较。请给出绝对误差和相对误差的统计结果（至少包括最大值、平均值与中位数）。
-    - 使用训练好的权重和有意义的输入数据更有说服力。如果选手使用了随机权重和输入数据，请在这里注明。
-    - 在精度损失较大的情况下，鼓励选手用训练好的权重和测试数据集对模型优化前与优化后的准确度指标做全面比较，以增强说服力。
-- 性能：例如可以用图表展示不同batch size或sequence length下性能加速效果（考虑到可能模型可能比较大，可以只给batch size为1的数据）
-  - 一般用原始模型作为baseline
-  - 一般提供模型推理时间的加速比即可；若能提供压力测试下的吞吐提升则更好。
+本工作针对 GPT-Medium 模型在 tensorrt-llm 上实现了三个优化点：
+- 优化点1: 减少显式同步的次数
+- 优化点2: 优化 layer norm 的计算
+- 优化点3: 合并计算减少 elementwise 计算开销
+
+测试命令
+```bash
+python benchmark.py -m gpt_350m --mode plugin --batch_size "1;8;64" --input_output_len "64,20;128,20;64,120;128,120" --engine_dir gpt2 --skip_step=8 --check_step=4
+```
+
+#### 精度
+开启三个优化后，原始模型与优化模型的 Rouge score 差异(GPT-Medium)。此处延迟高是因为没有做 warmup，包含了 build plan 的时间。
+```
+TensorRT-LLM (total latency: 66.98257255554199 sec)
+TensorRT-LLM beam 0 result
+  rouge1 : 20.735151996347536
+  rouge2 : 6.1022639415477835
+  rougeL : 16.40108348647125
+  rougeLsum : 18.184358801291715
+Hugging Face (total latency: 14.055776119232178 sec)
+HF beam 0 result
+  rouge1 : 18.182978950152904
+  rouge2 : 5.166241888544473
+  rougeL : 14.851620358520162
+  rougeLsum : 16.95757748412272
+```
+
+#### 性能
+| (batch, input_len, output_len) | base | opt | 加速比 |
+| ---- | ---- | ---- | ---- |
+| (1, 64, 20)| 51.72 | 46.75 | 1.106 |
+| (8, 64, 20)| 61.36 | 55.95 | 1.097 |
+| (64, 64, 20)| 146.05 | 132.19 | 1.105 |
+| (1, 128, 20)| 53.32 | 48.25 | 1.105 |
+| (8, 128, 20)| 71.47| 64.79 | 1.103 |
+| (64, 128, 20)| 222.42 | 202.71 | 1.097 |
+| (1, 64, 120)| 305.35 | 278.99 | 1.094 |
+| (8, 64, 120)| 345.49 | 318.35 | 1.085 |
+| (64, 64, 120)| 634.63 | 604.63 | 1.050 |
+| (1, 128, 120)| 312.75 | 287.21 | 1.089 |
+| (8, 128, 120)| 367.25| 339.14 | 1.083 |
+| (64, 128, 120)| 787.35 | 750.78 | 1.049 |
+
+通过优化在不同的参数下获得 4.9%～10.6% 的加速。
 
 请注意：
 
 - 相关测试代码也需要包含在代码仓库中，可被复现。
 - 请写明云主机的软件硬件环境，方便他人参考。
+  - 硬件: A10 gpu, 16 核 Intel(R) Xeon(R) Platinum 8369B
+  - 软件镜像: registry.cn-hangzhou.aliyuncs.com/trt-hackathon/trt-hackathon:final_v1
 
 ### Bug报告（可选）
 
