@@ -136,7 +136,7 @@ nsys profile -o gpt2_raw_v2 python benchmark.py -m gpt_350m --mode plugin --batc
 其中 layer norm 在 tensorrt_llm 中是通过插件来实现的，比较方便我们来进行修改优化。
 
 通过分析 layer norm kernel 源码可以发现有如下可以优化的点：
-- layer norm 的 block_size 参数设置有错误，源码中设置为 ```dim3 block(min(hidden_dim, 1024));```，但实际上在能做向量化计算时，应该设置为 ```dim3 block(min(hidden_dim / vec_size, 1024));```。GPT-medium 的 hidden_dim 为 1024。由于一个 sm 最多能同时运行 2048 个线程，如果 block 中线程数为 1024，则一个 sm 最多能同时运行 2 个 block。此时如果 block 中线程数能正确设置为 512，则一个 sm 最多能同时运行 4 个 block。A10 有 72 个 sm，在 tokens 数较多的 Tctx 阶段，错误的线程数设置对性能影响较大。
+- layer norm 的 block_size 参数设置有错误，源码中设置为 ```dim3 block(min(hidden_dim, 1024));```，但实际上在能做向量化计算时，应该设置为 ```dim3 block(min(hidden_dim / vec_size, 1024));```。GPT-medium 的 hidden_dim 为 1024。由于 Compute Capability 8.6 的卡一个 sm 最多能同时运行 1536 个线程，如果 block 中线程数为 1024，则一个 sm 最多能同时运行 1 个 block。此时如果 block 中线程数能正确设置为 512，则一个 sm 最多能同时运行 3 个 block。A10 有 72 个 sm，在 tokens 数较多的 Tctx 阶段，错误的线程数设置对性能影响较大。
 - layer norm 的通用实现在 hidden dim 较小时性能不够好。layer norm 中使用一个 CTA 来计算一行的结果，并考虑了是否使用 shared memory。但在 hidden dim 为 1024 的场景，可以使用一个 warp 来计算一行的结果，直接使用寄存器来做缓存。
 - 在加载 gamma 和 beta 参数的时候可以使用 __ldg 来做 cache。
 
@@ -174,6 +174,8 @@ nsys profile -o gpt2_raw_v2 python benchmark.py -m gpt_350m --mode plugin --batc
 通过合并这些计算，有可能进一步减少 elementwise 操作的时间。在探索过程中，我们调研了 [cutlass](https://github.com/NVIDIA/cutlass) 和 [cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend) 两种方案。在 cutlass 中通过添加 EpilogueOp 来在矩阵乘法之后做一些 elementwise 的操作。但在单测时发现有一些尺寸，不管设置怎样的 ```ThreadblockShape```、```WarpShape```、```InstructionShape``` 都没有拆分成两个 kernel 快。基于此选择了实测性能更好的 cudnn-frontend 方案。我们开发了两个 TensorRT 插件：
 - GemmBiasAct：实现 GEMM + AddBias + GeLU 逻辑，由于 cudnn-frontend 中 ```MatMul``` 操作不支持设置 transpose，所以在模型导出和加载时 ```mlp.c_fc.weight``` 需要做一些转置的修改。另外 cudnn-frontend 需要先 build 生成 plan，执行时再用具体的数据来执行 plan，由于 build 耗时比较长，在代码中需要缓存不同参数的 plan。
 - GemmBiasRes：实现了 GEMM + AddBias + Residual 逻辑。按照 GemmBiasAct 的思路来实现，但在实测中发现性能比 base 版本慢了很多，原因在于 base 版本在计算小尺寸 GEMM 的时候采用了 splitK 方案，比 cudnn 中的 GEMM 快很多。基于此我们将 ```MatMul``` 操作替换成了一个 1*1 的 ```Conv``` 操作，测试下来速度比 base 版本更快。cudnn 中并没有支持 Conv 与 GeLU 的融合，所以 GemmBiasAct 中继续采用 ```MatMul```。
+
+在多机或者多卡环境下，GemmBiasAct 中并没有 allgather 或者 allreduce 操作，所以不需要做任何改变。GemmBiasRes 操作 base 版本的计算逻辑为 allreduce(Gemm) + Bias + Res，合并之后将计算逻辑修改为 allreduce(Gemm + beta * Bias + beta * Res)，其中 beta 为 1.0 / tp_size，通过设置 beta 参数能做到在多机多卡环境下和 base 版本计算逻辑一致。
 
 ![block fuse](./docs/block_fuse.png)
 对比上图中 block 内的计算与 base 版本的计算可以发现优化后的版本能有效减少 elementwise 操作的开销。
